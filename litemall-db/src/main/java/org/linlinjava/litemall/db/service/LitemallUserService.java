@@ -21,6 +21,15 @@ public class LitemallUserService {
         return userMapper.selectByPrimaryKey(userId);
     }
 
+    /**
+     * 以用户维度加排他锁，串行化同一用户的并发下单。
+     * 不加 @Transactional：加入调用方的事务，锁随调用方事务提交而释放。
+     */
+    public LitemallUser lockById(Integer id) {
+        return userMapper.selectByPrimaryKeyForUpdate(id);
+    }
+
+
     public UserVo findUserVoById(Integer userId) {
         LitemallUser user = findById(userId);
         UserVo userVo = new UserVo();

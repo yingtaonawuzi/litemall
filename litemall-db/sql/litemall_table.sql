@@ -158,7 +158,8 @@ CREATE TABLE `litemall_cart` (
   `add_time` datetime DEFAULT NULL COMMENT '创建时间',
   `update_time` datetime DEFAULT NULL COMMENT '更新时间',
   `deleted` tinyint(1) DEFAULT '0' COMMENT '逻辑删除',
-  PRIMARY KEY (`id`)
+  PRIMARY KEY (`id`),
+  KEY `idx_cart_user_deleted` (`user_id`, `deleted`)
 ) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COMMENT='购物车商品表';
 /*!40101 SET character_set_client = @saved_cs_client */;
 
@@ -823,7 +824,9 @@ CREATE TABLE `litemall_user` (
   `update_time` datetime DEFAULT NULL COMMENT '更新时间',
   `deleted` tinyint(1) DEFAULT '0' COMMENT '逻辑删除',
   PRIMARY KEY (`id`),
-  UNIQUE KEY `user_name` (`username`)
+  UNIQUE KEY `user_name` (`username`),
+  KEY `idx_user_openid_deleted` (`weixin_openid`, `deleted`),
+  KEY `idx_user_mobile_deleted` (`mobile`, `deleted`)
 ) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
 /*!40101 SET character_set_client = @saved_cs_client */;
 

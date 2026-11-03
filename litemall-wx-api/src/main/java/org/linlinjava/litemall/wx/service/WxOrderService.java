@@ -305,7 +305,13 @@ public class WxOrderService {
             return ResponseUtil.badArgument();
         }
 
-        // 收货地址
+
+// 以用户行锁串行化同一用户的并发下单：
+// 后到的请求会阻塞到前一个事务提交，此时购物车已清空，会返回参数错误
+        userService.lockById(userId);
+
+// 收货地址
+
         LitemallAddress checkedAddress = addressService.query(userId, addressId);
         if (checkedAddress == null) {
             return ResponseUtil.badArgument();
@@ -323,9 +329,15 @@ public class WxOrderService {
         if (cartId.equals(0)) {
             checkedGoodsList = cartService.queryByUidAndChecked(userId);
         } else {
-            LitemallCart cart = cartService.findById(cartId);
+            LitemallCart cart = cartService.findById(userId, cartId);
+            if (cart == null) {
+                // 购物车行不属于当前用户，或已被删除
+                return ResponseUtil.badArgumentValue();
+
+            }
             checkedGoodsList = new ArrayList<>(1);
             checkedGoodsList.add(cart);
+
         }
         if (checkedGoodsList.size() == 0) {
             return ResponseUtil.badArgumentValue();
