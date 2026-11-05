@@ -10,6 +10,7 @@ import org.linlinjava.litemall.core.validator.Sort;
 import org.linlinjava.litemall.db.domain.*;
 import org.linlinjava.litemall.db.service.*;
 import org.linlinjava.litemall.wx.annotation.LoginUser;
+import org.linlinjava.litemall.core.service.GoodsCacheService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.util.StringUtils;
 import org.springframework.validation.annotation.Validated;
@@ -68,6 +69,10 @@ public class WxGoodsController {
 	private LitemallSearchHistoryService searchHistoryService;
 
 	@Autowired
+	private GoodsCacheService goodsCacheService;
+
+
+	@Autowired
 	private LitemallGoodsSpecificationService goodsSpecificationService;
 
 	@Autowired
@@ -92,7 +97,12 @@ public class WxGoodsController {
 	@GetMapping("detail")
 	public Object detail(@LoginUser Integer userId, @NotNull Integer id) {
 		// 商品信息
-		LitemallGoods info = goodsService.findById(id);
+		LitemallGoods info = goodsCacheService.findById(id);
+
+		// 商品不存在（含空值缓存命中）直接返回，避免后续使用 info 抛空指针
+		if (info == null) {
+			return ResponseUtil.badArgumentValue();
+		}
 
 		// 商品属性
 		Callable<List> goodsAttributeListCallable = () -> goodsAttributeService.queryByGid(id);

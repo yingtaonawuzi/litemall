@@ -111,3 +111,11 @@ litemall:
       accessKey: 111111
       secretKey: xxxxxx
       bucketName: litemall
+
+# Redis 配置放在 core profile，litemall-all 与 litemall-wx-api 均会激活该 profile
+spring:
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    database: 0
+    timeout: 3000ms

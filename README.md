@@ -317,6 +317,292 @@ checkedGoodsList.add(cart);
 | `cartId` 指向不存在的行 | `NullPointerException` | 返回「参数不对」 |
 | 正常使用自己的 `cartId` | 成功 | 成功 |
 
+### 5. 商品详情接口无缓存，重复查询主表
+
+**现象**
+
+`/wx/goods/detail` → `WxGoodsController.detail()`（`WxGoodsController.java:98`）每次请求都直接查库：
+
+```java
+LitemallGoods info = goodsService.findById(id);
+```
+
+这是 C 端最高频的接口，首页、分类、搜索、分享进入详情页都会打到这里，而 `litemall_goods` 还挂着 `detail`（富文本）、`gallery`（图集）两个大字段。
+
+**影响**
+
+| 项 | 改前 |
+|------|------|
+| 单次响应 | 660 ms |
+| 同一商品重复访问 | 每次都读同一行 |
+| 数据库压力 | 随 UV 线性增长，商品详情是典型「读多写极少」的热点 |
+
+**改造**
+
+1. `litemall-core/pom.xml` 补 Redis 依赖。core 原本只用 web / mail / 七牛，不认识 `RedisTemplate`：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+不写版本号，由根 `pom.xml` 的 Spring Boot BOM 统一管理（2.1.5 → spring-data-redis 2.1.8）。
+
+2. 缓存类放 `litemall-core`，而不是 `litemall-wx-api`。
+
+这一步是被迫的：后台改完商品要删缓存，但 `litemall-admin-api/pom.xml` 的 `<dependencies>` 里只有 `core` 和 `db`，**看不见 `wx-api`**，代码写下去直接编译不过。反向让 `admin-api` 依赖 `wx-api` 又属于平级业务模块耦合，还会与 `litemall-all` 形成依赖环。
+
+判定标准：**一个类放在哪个模块，看的是「谁需要看见它」，不是「它最初为谁服务」。** 双方都要用，就下沉到公共的 `core`。
+
+3. `RedisConfig` 随之从 `wx.config` 移到 `core.config`。配置要跟着 Bean 走，否则单独启动 `admin-api` 时找不到 `RedisTemplate`。
+
+4. 失效链路接上：
+
+| 位置 | 动作 |
+|------|------|
+| `WxGoodsController.java:100`（读） | `goodsCacheService.findById(id)` |
+| `AdminGoodsService.java:177`（更新） | `evictWithDelay(id)` |
+| `AdminGoodsService.java:234`（删除） | `evict(id)` |
+
+**验证**
+
+连续请求同一商品（`litemall:goods:1181000`）：
+
+| 请求 | 状态 | 耗时 |
+|------|------|------|
+| 第 1 次 | miss，回源 | 660 ms |
+| 第 2 次 | hit | 69 ms |
+| 第 3 次 | hit | 49 ms |
+| 第 4 次 | hit | 48 ms |
+
+`TTL = 1800`（30 分钟），`GET litemall:goods:1181000` 返回可直接阅读的 JSON。
+
+> 需要说清的边界：48 ms 里的大头并不是商品主表，而是 `detail()` 内另外几次查询（规格、属性、评论、品牌、团购）。本次只缓存了主表，**要再快一个量级，得把整个聚合结果作为一个 key 缓存**，这是下一步。
+
+### 6. 缓存命中抛 ClassCastException：序列化方式选型
+
+**现象**
+
+加完缓存后出现一个极不直观的现象：
+
+> 缓存未命中时正常返回 200，缓存命中时必然 502。
+
+日志给出：
+
+```
+ClassCastException: LitemallGoods cannot be cast to LitemallGoods
+(LitemallGoods is in unnamed module of loader 'app';
+ LitemallGoods is in unnamed module of loader
+ org.springframework.boot.devtools.restart.classloader.RestartClassLoader)
+```
+
+同一个类名，强转失败。
+
+**根因**
+
+两个因素叠加：
+
+| 因素 | 作用 |
+|------|------|
+| `JdkSerializationRedisSerializer` | 只写「类名 + 字段」，**不记录类加载器** |
+| devtools 热重启 | 项目类由 `RestartClassLoader` 加载，与 `app` 各有一份同名类 |
+
+反序列化按类名反射加载，拿到的不是当前上下文那一份，于是强转失败。
+
+**改造**
+
+换 JSON 序列化，并**显式指定目标类型**：
+
+```java
+Jackson2JsonRedisSerializer<LitemallGoods> serializer =
+        new Jackson2JsonRedisSerializer<>(LitemallGoods.class);
+serializer.setObjectMapper(mapper);   // 注册 JavaTimeModule
+```
+
+反序列化直接使用代码中的 `LitemallGoods.class` 引用，不走类名反射，从根上绕开类加载器问题。
+
+两个必须配套的细节：
+
+- `LitemallGoods` 含 `LocalDateTime`，Jackson 默认抛 `InvalidDefinitionException`，必须 `registerModule(new JavaTimeModule())` 并关闭 `WRITE_DATES_AS_TIMESTAMPS`；
+- `spring-data-redis 2.1.8` 的 `Jackson2JsonRedisSerializer` **只有 `(Class)` 和 `(JavaType)` 构造器**，没有 `(ObjectMapper, Class)`，也没有 `(Jackson2ObjectMapperBuilder, Class)`（更高版本才有）。只能先 `new Xxx(Class)` 再 `setObjectMapper()`。
+
+**验证**
+
+| 请求 | errno | 耗时 | 商品名 |
+|------|-------|------|--------|
+| hit | 0 | 69 ms | 正确 |
+| hit | 0 | 49 ms | 正确 |
+
+`GET` 出来的内容是可读 JSON，不再是二进制块。
+
+排查途中记下两条经验：
+
+1. **Maven 增量编译不清理「源码已删除」的 `.class`**。删掉 `wx/service/GoodsCacheService.java` 后，`target/classes` 里仍有旧 class，启动时两个同名 `@Service` 撞车，抛 `ConflictingBeanDefinitionException`。必须 `mvn clean`。
+2. **加日志前先确认日志级别**。`logback-spring.xml:53` 把 `org.linlinjava.litemall.core` 限死在 `ERROR`，在 core 包里写 `log.info` 等于死代码，容易误判成「代码没执行」。
+
+### 7. 不存在的商品 id 造成缓存穿透
+
+**现象**
+
+`findById` 查不到时若直接返回、不写缓存，则每个伪造 id 的请求都会落到数据库。同时暴露出一处既有缺陷——`detail()` 对 `info` 没有判空：
+
+```java
+LitemallGoods info = goodsCacheService.findById(id);
+// 之后被异步线程直接使用，未判空
+```
+
+传入不存在的 id 时 `info` 为 `null`，在 `brandCallable` 里抛 `NullPointerException`，被全局异常处理器兜成 502。
+
+**影响**
+
+| 场景 | 结果 |
+|------|------|
+| 伪造 id 循环请求 | 每次直达数据库，缓存形同虚设 |
+| 不存在 / 已下架的 id | 502 系统内部错误，而不是参数错误 |
+
+**改造**
+
+1. 查不到时写一个**独立前缀**的空值标记，TTL 只给 60 秒：
+
+```java
+if (goods == null) {
+    stringRedisTemplate.opsForValue()
+            .set(NULL_KEY_PREFIX + id, "1", NULL_TTL_SECONDS, TimeUnit.SECONDS);
+    return null;
+}
+```
+
+2. 读取时先判标记，命中直接返回，不再回源（`GoodsCacheService.java:70`）。
+
+3. `detail()` 补判空（`WxGoodsController.java:103`）：
+
+```java
+if (info == null) {
+    return ResponseUtil.badArgumentValue();
+}
+```
+
+两处取舍：
+
+- **独立 key，而不是往正常 key 里塞 `null`**：正常 key 的 value 序列化器是 `LitemallGoods`，写不进 `null`；分开后语义清晰，`evict` 时两个一起删。
+- **60 秒 ≪ 30 分钟**：商品可能之后才上架，空值扛 30 分钟会变成「商品在售却提示不存在」的线上事故。**空值 TTL 必须显著短于正常 TTL。**
+
+**验证**
+
+请求不存在的 id（`999999`）：
+
+| 请求 | errno | 耗时 | null key |
+|------|-------|------|----------|
+| 第 1 次 | 402 | 557 ms | 写入，`ttl = 60` |
+| 第 2 次 | 402 | 21 ms | 命中，不再回源 |
+
+### 8. 热点 key 过期瞬间的缓存击穿
+
+**现象**
+
+热点商品缓存过期的那一刻，多个并发请求同时发现 miss，全部回源查同一行数据。
+
+**影响**
+
+数据库瞬时压力被放大 N 倍，且查的是完全相同的记录，属于纯粹浪费。
+
+**改造**
+
+分段锁 + 双重检查（`GoodsCacheService.java:75`）：
+
+```java
+synchronized (rebuildLocks[Math.floorMod(id, rebuildLocks.length)]) {
+    // 等锁期间可能已被别的线程回填
+    cached = readCache(key);
+    if (cached != null) {
+        return cached;
+    }
+    // ... 回源并写缓存
+}
+```
+
+几处取舍：
+
+- **64 个锁而不是一把全局锁**：全局锁会让「商品 A 重建」阻塞「商品 B 重建」，把并发退化成串行；按 `id % 64` 分段，冲突概率极低，内存代价可忽略。
+- **锁内必须再查一次缓存**：即双重检查，等锁的这几毫秒里第一个线程往往已经填好。
+- **用 `Math.floorMod` 而不是 `%`**：`%` 对负数返回负值，会导致数组下标越界，`floorMod` 永远非负。
+
+**验证**
+
+清空缓存 → 20 个线程同时请求同一商品。
+
+这里有个方法论值得记录：**耗时无法证明锁是否生效**。20 个请求全部落在 374~454 ms，看着像「1 个查库 + 19 个等待」，但「20 个各自查库」也可能是这个量级。改用 Redis 自身的命令统计才拿到硬证据：
+
+```
+CONFIG RESETSTAT
+删 key → 并发 20 → INFO commandstats
+
+cmdstat_setex:calls=1     ← 只写了 1 次缓存
+cmdstat_get:calls=29      ← 20 次首查 + 9 次等锁后的双重检查
+```
+
+无锁时 `setex` 会是 20。
+
+### 9. 更新与缓存的一致性：延迟双删
+
+**现象**
+
+`update` 事务提交前，并发读请求读到旧值并回填缓存；事务提交后，缓存里留下一条「刚被回填的旧数据」，要等 TTL 到期才消失。
+
+**改造**
+
+第一次删除立即执行，第二次挂在**事务提交之后**延迟执行（`GoodsCacheService.java:120`）：
+
+```java
+public void evictWithDelay(final Integer id) {
+    evict(id);
+
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronizationAdapter() {
+            @Override
+            public void afterCommit() {
+                scheduleEvict(id);
+            }
+        });
+    } else {
+        scheduleEvict(id);
+    }
+}
+```
+
+**这里踩了一个只有实测才能发现的坑**：第一版是「先删 → 固定延迟 500 ms → 再删」。但 `update` 实测耗时 **631~729 ms**（内部要生成分享海报），时间线变成：
+
+| 时刻 | 事件 |
+|------|------|
+| 0 | 第一次删除 |
+| 500 | 第二次删除执行 —— 事务还没提交，缓存本就是空的，**白删** |
+| 631 | 事务提交 |
+| 631+ | 读请求回填旧值，缓存重新变脏 |
+
+验证数据直接暴露问题：`update` 后 800 ms 查 keys，key 仍然存在。
+
+**结论：延迟必须相对于「事务提交」，而不是相对于「方法调用」。事务耗时超过延迟时间，机制就完全失效。**
+
+**验证**
+
+| 步骤 | 观察 |
+|------|------|
+| 建立缓存 | `keys = [litemall:goods:1181000]` |
+| `update` 改名（631 ms） | — |
+| 返回后立即查 | `keys = []`（第一次删除） |
+| 立即读一次 | 返回新值，`keys = [key]`（回填） |
+| 等 1600 ms | `keys = []`（第二次删除清掉了回填） |
+
+先让机制失败、再让它成功，这个对比本身就是最有力的证据。
+
+**已知边界**
+
+- 分段锁是**单机锁**。多实例部署时同一 key 会在每个实例各回源一次，需换 Redisson 分布式锁。
+- 延迟双删只是**缩小窗口，不是强一致**。提交后 500 ms 之外的回填仍可能残留，最终靠 TTL 兜底；要强一致需订阅 binlog（Canal）驱动失效。
+- TTL 固定 30 分钟，同批写入会同时失效，极端情况有雪崩风险，可加随机抖动。
+
 ---
 
 # litemall

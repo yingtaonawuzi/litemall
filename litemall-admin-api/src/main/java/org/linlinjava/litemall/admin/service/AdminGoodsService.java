@@ -5,6 +5,7 @@ import org.apache.commons.logging.LogFactory;
 import org.linlinjava.litemall.admin.dto.GoodsAllinone;
 import org.linlinjava.litemall.admin.vo.CatVo;
 import org.linlinjava.litemall.core.qcode.QCodeService;
+import org.linlinjava.litemall.core.service.GoodsCacheService;
 import org.linlinjava.litemall.core.util.ResponseUtil;
 import org.linlinjava.litemall.db.domain.*;
 import org.linlinjava.litemall.db.service.*;
@@ -41,6 +42,8 @@ public class AdminGoodsService {
     private LitemallCartService cartService;
     @Autowired
     private QCodeService qCodeService;
+    @Autowired
+    private GoodsCacheService goodsCacheService;
 
     public Object list(Integer goodsId, String goodsSn, String name,
                        Integer page, Integer limit, String sort, String order) {
@@ -170,6 +173,8 @@ public class AdminGoodsService {
         if (goodsService.updateById(goods) == 0) {
             throw new RuntimeException("更新数据失败");
         }
+        // 主表已更新，先删一次缓存，延迟后再删一次（延迟双删），兜住并发下被回填的旧值
+        goodsCacheService.evictWithDelay(goods.getId());
 
         Integer gid = goods.getId();
 
@@ -225,6 +230,8 @@ public class AdminGoodsService {
         specificationService.deleteByGid(gid);
         attributeService.deleteByGid(gid);
         productService.deleteByGid(gid);
+        // 商品已删除，清除详情缓存，避免继续返回已下架商品
+        goodsCacheService.evict(gid);
         return ResponseUtil.ok();
     }
 
